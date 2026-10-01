@@ -59,7 +59,6 @@ services:
         condition: service_started
     volumes:
       - ./backend:/app
-    command: celery -A app.celery_app.celery_app worker --loglevel=info
-
+    command: celery -A app.celery_app.celery_app worker -c 1 --loglevel=info &
 volumes:
   pgdata:
