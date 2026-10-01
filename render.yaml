@@ -1,0 +1,65 @@
+databases:
+  - name: wardwise-db
+    plan: free
+    databaseName: fnph_yaba
+    user: fnph
+
+services:
+  - type: keyvalue
+    name: wardwise-redis
+    plan: free
+    ipAllowList: []
+
+  - type: web
+    name: wardwise-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: wardwise-db
+          property: connectionString
+      - key: CELERY_BROKER_URL
+        fromService:
+          type: keyvalue
+          name: wardwise-redis
+          property: connectionString
+      - key: CELERY_RESULT_BACKEND
+        fromService:
+          type: keyvalue
+          name: wardwise-redis
+          property: connectionString
+      - key: MODEL_ARTIFACT_DIR
+        value: /app/model_artifacts
+      - key: RANDOM_SEED
+        value: "42"
+
+  - type: worker
+    name: wardwise-worker
+    runtime: docker
+    plan: free
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    dockerCommand: celery -A app.celery_app.celery_app worker --loglevel=info
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: wardwise-db
+          property: connectionString
+      - key: CELERY_BROKER_URL
+        fromService:
+          type: keyvalue
+          name: wardwise-redis
+          property: connectionString
+      - key: CELERY_RESULT_BACKEND
+        fromService:
+          type: keyvalue
+          name: wardwise-redis
+          property: connectionString
+      - key: MODEL_ARTIFACT_DIR
+        value: /app/model_artifacts
+      - key: RANDOM_SEED
+        value: "42"
