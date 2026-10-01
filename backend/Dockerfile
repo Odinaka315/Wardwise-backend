@@ -13,5 +13,6 @@ RUN pip install --no-cache-dir --default-timeout=1000 --retries 10 -r requiremen
 COPY . .
 
 EXPOSE 8000
-
-CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+CMD ["/app/entrypoint.sh"]
