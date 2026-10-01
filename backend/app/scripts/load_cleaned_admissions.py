@@ -14,6 +14,7 @@ Run this ONCE after downloading admissions_cleaned.csv from Drive.
 
 Usage (from the project root, with docker compose up -d running):
     docker compose exec api python -m app.scripts.load_cleaned_admissions
+    firebender
 """
 
 import pandas as pd
