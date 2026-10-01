@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 db/init/*.sql
 backend/data/*.csv
+.env.example
