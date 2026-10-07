@@ -10,11 +10,12 @@ crisis_unit_hourly).
 import numpy as np
 import pandas as pd
 from sqlalchemy import text
+from dataclasses import replace
 
 from app.celery_app import celery_app
 from app.db import engine
 from app.services.sim_engine import (
-    SimConfig, calibrate_phi, modify_P, run_replications, simulate, analytic_headcount,
+    SimConfig, calibrate_phi, modify_P, run_replications, simulate, analytic_headcount, BED_STATES
 )
 
 TRANSIENT = ["Acute inpatient", "Rehabilitation inpatient", "Day hospital",
@@ -213,3 +214,161 @@ def strike_trajectory(n_seeds: int = 40) -> dict:
                 "directly, so Rehab only feels the shock once patients who would have "
                 "moved in are missing.",
     }
+
+
+
+# (add `BED_STATES` to the existing sim_engine import line at the top of the file:)
+# from app.services.sim_engine import (
+#     SimConfig, calibrate_phi, modify_P, run_replications, simulate, analytic_headcount, BED_STATES,
+# )
+
+GROUP_IDX = {"ACUTE": ACUTE, "REHAB": REHAB, "DAY": DAY}       # string <-> bed-group index
+GROUP_NAME = {v: k for k, v in GROUP_IDX.items()}
+
+EVENT_DEFAULTS = {
+    "strike": {"arrival_factor": 0.532, "discharge_factor": 0.891},   # same factors as scenario 4
+    "surge": {"arrival_factor": 1.25, "discharge_factor": 1.0},
+    "freeze": {"arrival_factor": 0.0, "discharge_factor": 1.0},        # admissions paused, discharges continue
+}
+
+MIN_REPLICATIONS, MAX_REPLICATIONS = 20, 100
+
+
+def baseline_defaults_payload() -> dict:
+    """JSON-safe snapshot of the calibrated baseline, for the custom-scenario form
+    to pre-fill itself from. Cheap (DB read + calibration, no Monte Carlo), so this
+    is called directly from the router, not as a Celery task."""
+    baseline_cfg, _ = _build_baseline()
+    return {
+        "capacity": {name: int(baseline_cfg.capacity[idx]) for name, idx in GROUP_IDX.items()},
+        "phi": {name: round(float(baseline_cfg.phi[idx]), 4) for name, idx in GROUP_IDX.items()},
+        "bed_cost_per_day_ngn": {name: baseline_cfg.bed_cost_per_day[idx] for name, idx in GROUP_IDX.items()},
+        "community_cost_per_month_ngn": {
+            "outpatient_follow_up": baseline_cfg.community_cost_per_month[OPD],
+            "community_relapse": baseline_cfg.community_cost_per_month[RELAPSE],
+        },
+        "demand_multiplier": baseline_cfg.demand_multiplier,
+        "overcrowd_dropout": baseline_cfg.overcrowd_dropout,
+        "horizon_months": baseline_cfg.horizon,
+        "warmup_months": baseline_cfg.warmup,
+        "entry_window_months": baseline_cfg.entry_window,
+        "default_replications": N_REPS,
+        "event_types": {"none": None, **EVENT_DEFAULTS},
+        "note": "Beds are grouped into three pathway stages (Acute, Rehabilitation, Day "
+                "hospital), not the ten individual wards used in the bed-reallocation model "
+                "-- Acute combines ACM+ACF and Rehabilitation combines DRU+LSR.",
+    }
+
+
+def _build_custom_config(baseline_cfg, overrides: dict):
+    """Apply a JSON-safe overrides dict (the /custom request body) onto the calibrated
+    baseline SimConfig. Anything not present in `overrides` stays at the baseline value."""
+    kwargs = {}
+
+    cap_over = overrides.get("capacity_overrides") or {}
+    if cap_over:
+        new_capacity = dict(baseline_cfg.capacity)
+        for name, beds in cap_over.items():
+            if name not in GROUP_IDX:
+                raise ValueError(f"Unknown capacity group '{name}'; expected one of {list(GROUP_IDX)}")
+            if beds < 0:
+                raise ValueError(f"capacity_overrides.{name} must be >= 0")
+            new_capacity[GROUP_IDX[name]] = int(beds)
+        kwargs["capacity"] = new_capacity
+
+    if overrides.get("demand_multiplier") is not None:
+        kwargs["demand_multiplier"] = float(overrides["demand_multiplier"])
+
+    if overrides.get("overcrowd_dropout") is not None:
+        kwargs["overcrowd_dropout"] = float(overrides["overcrowd_dropout"])
+
+    horizon = int(overrides.get("horizon_months") or baseline_cfg.horizon)
+    kwargs["horizon"] = horizon
+
+    event = overrides.get("event") or {"type": "none"}
+    event_type = event.get("type", "none")
+    events, event_window = {}, None
+    if event_type != "none":
+        start = int(event.get("start_month", 0))
+        duration = int(event.get("duration_months", 0))
+        if duration <= 0:
+            raise ValueError("event.duration_months must be > 0 when event.type is not 'none'")
+        if start < 0 or start + duration > horizon:
+            raise ValueError("event window must fall within horizon_months")
+        defaults = EVENT_DEFAULTS.get(event_type, {"arrival_factor": 1.0, "discharge_factor": 1.0})
+        arr_f = float(event.get("arrival_factor") or defaults["arrival_factor"])
+        dis_f = float(event.get("discharge_factor") or defaults["discharge_factor"])
+        for m in range(start, start + duration):
+            events[m] = (arr_f, dis_f)
+        event_window = (start, duration)
+    kwargs["events"] = events
+
+    return replace(baseline_cfg, **kwargs), event_window
+
+
+def _warnings_for(custom_cfg) -> list:
+    warnings = []
+    head = analytic_headcount(custom_cfg)
+    for g in BED_STATES:
+        implied_demand = custom_cfg.phi[g] * head[g]
+        if custom_cfg.capacity[g] < implied_demand:
+            warnings.append(
+                f"{GROUP_NAME[g]} capacity ({custom_cfg.capacity[g]} beds) is below the "
+                f"steady-state demand this configuration implies (~{implied_demand:.0f} beds); "
+                f"expect sustained overflow even without the disruption event."
+            )
+    return warnings
+
+
+@celery_app.task(name="simulation.run_custom")
+def run_custom(overrides: dict) -> dict:
+    baseline_cfg, _ = _build_baseline()
+    custom_cfg, event_window = _build_custom_config(baseline_cfg, overrides)
+
+    reps = int(overrides.get("replications") or N_REPS)
+    reps = max(MIN_REPLICATIONS, min(MAX_REPLICATIONS, reps))
+
+    mean_result = run_replications(custom_cfg, n_reps=reps, seed0=777)["mean"]
+    result = {k: float(v) for k, v in mean_result.to_dict().items()}
+    result["label"] = overrides.get("label", "Custom scenario")
+    result["warnings"] = _warnings_for(custom_cfg)
+    result["trajectory"] = None
+
+    if event_window is not None:
+        start, duration = event_window
+        # Only worth a trajectory when the event is short relative to the horizon --
+        # otherwise the full-horizon summary above already represents it fairly
+        # (this is exactly the lesson from the scenario-4 full-horizon-average bug).
+        if duration <= max(6, int(0.15 * custom_cfg.horizon)):
+            n_seeds = min(30, reps)
+            pre = min(6, start)
+            post = min(24, custom_cfg.horizon - (start + duration))
+            window = slice(start - pre, start + duration + post)
+            months = (np.arange(start - pre, start + duration + post) - start).tolist()
+
+            base_runs = {g: [] for g in BED_STATES}
+            custom_runs = {g: [] for g in BED_STATES}
+            baseline_long = replace(baseline_cfg, horizon=custom_cfg.horizon)
+            for seed in range(n_seeds):
+                rb = simulate(baseline_long, seed=seed)
+                rc = simulate(custom_cfg, seed=seed)
+                for g in BED_STATES:
+                    base_runs[g].append(baseline_cfg.phi[g] * rb["counts"][window, g] / baseline_cfg.capacity[g])
+                    custom_runs[g].append(custom_cfg.phi[g] * rc["counts"][window, g] / custom_cfg.capacity[g])
+
+            trajectory = {"months_relative_to_event": months}
+            for g in BED_STATES:
+                base_avg = np.mean(base_runs[g], axis=0)
+                custom_avg = np.mean(custom_runs[g], axis=0)
+                gap = custom_avg - base_avg
+                trough_i = int(np.argmin(gap)) if gap.size else 0
+                trajectory[GROUP_NAME[g].lower()] = {
+                    "baseline_occupancy": base_avg.round(4).tolist(),
+                    "scenario_occupancy": custom_avg.round(4).tolist(),
+                    "gap": gap.round(4).tolist(),
+                    "deepest_dip_month_offset": months[trough_i] if gap.size else None,
+                    "deepest_dip_gap": round(float(gap[trough_i]), 4) if gap.size else None,
+                }
+            result["trajectory"] = trajectory
+
+    return result

@@ -10,6 +10,7 @@ from app.routers import segmentation
 from app.routers import model2
 from app.routers import bed_reallocation, roster, budget
 from app.routers import simulation
+from app.routers import overview, longstay, baseline
 
 app = FastAPI(
     title="FNPH Yaba — Model 2 API",
@@ -34,6 +35,9 @@ app.include_router(bed_reallocation.router)
 app.include_router(roster.router)
 app.include_router(budget.router)
 app.include_router(simulation.router)
+app.include_router(overview.router)
+app.include_router(longstay.router)
+app.include_router(baseline.router)
 
 @app.get("/health")
 def health():
