@@ -1,17 +1,10 @@
-"""
-Compulsory budget goal-programming model: reallocates the latest
-fiscal year's already-decided total budget ceiling across 88
-unit/cost_category goals, in strict tier order (1 = highest priority),
-weighted by strategic_priority_weight within each tier.
-
-Includes the Week 4 fix: a hard floor on Personnel lines (70% of
-current year-to-date spend) regardless of tier, after an initial
-naive strict-lock version produced a mathematically optimal but
-operationally impossible 0%-funded Personnel line at one unit. Tier
-locks use a 2% tolerance rather than an exact lock, for the same
-reason -- strict locking leaves the solver no incentive to protect
-anything outside the tier currently being optimised.
-"""
+# REPLACES app/services/budget.py in full.
+#
+# What changed: the two module-level constants (PERSONNEL_FLOOR_FRACTION,
+# TIER_TOLERANCE) are now optional parameters with the same defaults --
+# they were already written as named, documented tunables, just not yet
+# wired to a caller. Calling solve_budget() with no arguments reproduces
+# the original behaviour exactly.
 
 import pandas as pd
 import pulp
@@ -20,8 +13,8 @@ from sqlalchemy import text
 from app.celery_app import celery_app
 from app.db import engine
 
-PERSONNEL_FLOOR_FRACTION = 0.70
-TIER_TOLERANCE = 1.02
+PERSONNEL_FLOOR_FRACTION_DEFAULT = 0.70
+TIER_TOLERANCE_DEFAULT = 1.02
 
 
 def _load_inputs():
@@ -34,7 +27,10 @@ def _load_inputs():
 
 
 @celery_app.task(name="budget.solve")
-def solve_budget() -> dict:
+def solve_budget(
+    personnel_floor_fraction: float = PERSONNEL_FLOOR_FRACTION_DEFAULT,
+    tier_tolerance: float = TIER_TOLERANCE_DEFAULT,
+) -> dict:
     goals, total_budget_ceiling, latest_year = _load_inputs()
     n = len(goals)
 
@@ -45,7 +41,7 @@ def solve_budget() -> dict:
     for i in range(n):
         prob += alloc[i] + under[i] == goals.loc[i, "amount_requested_ngn"]
         if goals.loc[i, "cost_category"] == "Personnel":
-            floor = goals.loc[i, "amount_spent_ngn"] * PERSONNEL_FLOOR_FRACTION
+            floor = goals.loc[i, "amount_spent_ngn"] * personnel_floor_fraction
             prob += alloc[i] >= floor, f"PersonnelFloor_{i}"
 
     prob += pulp.lpSum([alloc[i] for i in range(n)]) <= total_budget_ceiling
@@ -59,7 +55,7 @@ def solve_budget() -> dict:
         if prev_tier_obj is not None:
             prob += pulp.lpSum(
                 [under[i] * goals.loc[i, "strategic_priority_weight"] for i in prev_idx]
-            ) <= prev_tier_obj * TIER_TOLERANCE + 1
+            ) <= prev_tier_obj * tier_tolerance + 1
         prob.setObjective(pulp.lpSum([under[i] * goals.loc[i, "strategic_priority_weight"] for i in idx]))
         prob.solve(pulp.PULP_CBC_CMD(msg=0))
         prev_tier_obj = pulp.value(prob.objective)
@@ -77,6 +73,14 @@ def solve_budget() -> dict:
 
     return {
         "fiscal_year": latest_year,
+        "assumptions": {
+            "personnel_floor_fraction": personnel_floor_fraction,
+            "tier_tolerance": tier_tolerance,
+            "is_baseline": (
+                personnel_floor_fraction == PERSONNEL_FLOOR_FRACTION_DEFAULT
+                and tier_tolerance == TIER_TOLERANCE_DEFAULT
+            ),
+        },
         "total_requested_ngn": float(goals["amount_requested_ngn"].sum()),
         "total_budget_ceiling_ngn": total_budget_ceiling,
         "structural_shortfall_pct": round(

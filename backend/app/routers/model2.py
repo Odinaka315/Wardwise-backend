@@ -1,28 +1,28 @@
 from celery.result import AsyncResult
 from fastapi import APIRouter
-
+from pydantic import BaseModel
 from app.celery_app import celery_app
 from app.services.model2 import solve_model2
 
+# ── app/api/v1/model2.py ────────────────────────────────────────────────
 router = APIRouter(prefix="/api/v1/model2", tags=["model2"])
-
-
+ 
+ 
+class Model2Assumptions(BaseModel):
+    demand_buffer_pct: float = 0.0
+    budget_multiplier: float = 1.0
+    nurse_ratio_multiplier: float = 1.0
+    doctor_ratio_multiplier: float = 1.0
+ 
+ 
 @router.post("/solve")
-def trigger_solve():
-    """Starts the bed & staffing optimisation as a background job and
-    returns immediately with a task_id -- the actual solve never runs
-    inside this request, per the brief's rule that long work must not
-    block the browser."""
-    task = solve_model2.delay()
-    return {"task_id": task.id, "status": "submitted"}
-
-
+def trigger_model2_solve(assumptions: Model2Assumptions = Model2Assumptions()):
+    task = solve_model2.delay(**assumptions.model_dump())
+    return {"task_id": task.id, "status": "submitted", "assumptions": assumptions.model_dump()}
+ 
+ 
 @router.get("/result/{task_id}")
-def get_solve_result(task_id: str):
-    """Poll this with the task_id from /solve. status will be PENDING
-    or STARTED while the worker is still solving, SUCCESS once the
-    full board-facing comparison is ready in `result`, or FAILURE if
-    the solve itself raised an error."""
+def get_model2_result(task_id: str):
     result = AsyncResult(task_id, app=celery_app)
     response = {"task_id": task_id, "status": result.status}
     if result.status == "SUCCESS":

@@ -1,18 +1,22 @@
-"""
-Model 2: bed & staffing configuration optimisation.
-
-Minimises total annual cost (beds + nurses + doctors, per unit)
-subject to: meeting each unit's 6-month average observed occupancy
-(from daily_census, not a forecast -- see MODELING_LOG.md for why),
-not exceeding the hospital's real physical bed stock, maintaining
-each unit's own currently-observed nurse/doctor-per-bed ratio as a
-safety floor, and staying within the latest fiscal year's allocated
-budget.
-
-Unlike the Week 1-3 models, there is nothing to "train" here -- every
-solve rebuilds its inputs fresh from the live database, so the
-recommendation always reflects current data, not a stale snapshot.
-"""
+# REPLACES app/services/model2.py in full.
+#
+# What changed: _solve() and solve_model2() now accept four optional
+# assumption parameters. Each is a bounded multiplier/buffer on a
+# constraint that already exists in the LP -- nothing new is invented.
+# Calling solve_model2() with no arguments reproduces the exact original
+# behaviour (all defaults are the identity value: buffer=0, multiplier=1).
+#
+#   demand_buffer_pct    -- inflate each unit's demand_beds by this % before
+#                            the Demand_{u} constraint. "What if occupancy
+#                            runs X% hotter/colder than the last 6 months?"
+#   budget_multiplier     -- scale the Budget_Ceiling constraint.
+#                            "What if the fiscal-year budget were cut/raised
+#                            by X%?"
+#   nurse_ratio_multiplier / doctor_ratio_multiplier
+#                          -- scale the per-bed staffing-ratio floor
+#                            (Nurse_Ratio_{u} / Doctor_Ratio_{u}).
+#                            "What if the minimum safe staffing ratio were
+#                            raised/lowered by X%?"
 
 import numpy as np
 import pandas as pd
@@ -24,11 +28,6 @@ from app.db import engine
 
 
 def _load_inputs() -> pd.DataFrame:
-    """Rebuilds the full Model 2 input table (demand, costs, staffing
-    ratios per unit) live from the database -- the same logic
-    validated in Colab, kept in one place so a solve always reflects
-    current data.
-    """
     with engine.connect() as conn:
         beds = pd.read_sql(text("SELECT * FROM beds"), conn)
         staff = pd.read_sql(text("SELECT * FROM staff"), conn)
@@ -51,10 +50,6 @@ def _load_inputs() -> pd.DataFrame:
         staff[staff["role"] == "Psychiatric Nurse"]
         .groupby("home_unit_id")["monthly_cost_ngn"].mean()
     )
-    # Doctor-equivalent grades: Consultant Psychiatrist, Senior
-    # Registrar, Registrar -- a plain "Psychiatrist" filter misses the
-    # registrar grades and silently drops any unit staffed only by
-    # registrars (caught during Week 4 validation).
     doctor_cost = (
         staff[staff["role"].str.contains("Psychiatrist|Registrar", case=False, na=False)]
         .groupby("home_unit_id")["monthly_cost_ngn"].mean()
@@ -79,7 +74,14 @@ def _load_inputs() -> pd.DataFrame:
     return inputs, total_bed_stock, total_budget, current_beds, latest_year
 
 
-def _solve(inputs: pd.DataFrame, total_bed_stock: int, total_budget: float):
+def _solve(
+    inputs: pd.DataFrame,
+    total_bed_stock: int,
+    total_budget: float,
+    demand_buffer_pct: float = 0.0,
+    nurse_ratio_multiplier: float = 1.0,
+    doctor_ratio_multiplier: float = 1.0,
+):
     units = inputs.index.tolist()
     prob = pulp.LpProblem("FNPH_Bed_Staff_Configuration", pulp.LpMinimize)
 
@@ -94,14 +96,16 @@ def _solve(inputs: pd.DataFrame, total_bed_stock: int, total_budget: float):
         for u in units
     ]), "Total_Annual_Cost"
 
+    buffer_mult = 1.0 + (demand_buffer_pct / 100.0)
     for u in units:
-        prob += beds_var[u] >= np.ceil(inputs.loc[u, "demand_beds"]), f"Demand_{u}"
+        buffered_demand = inputs.loc[u, "demand_beds"] * buffer_mult
+        prob += beds_var[u] >= np.ceil(buffered_demand), f"Demand_{u}"
 
     prob += pulp.lpSum([beds_var[u] for u in units]) <= total_bed_stock, "Total_Bed_Stock"
 
     for u in units:
-        prob += nurses_var[u] >= beds_var[u] * inputs.loc[u, "nurse_per_bed"], f"Nurse_Ratio_{u}"
-        prob += doctors_var[u] >= beds_var[u] * inputs.loc[u, "doctor_per_bed"], f"Doctor_Ratio_{u}"
+        prob += nurses_var[u] >= beds_var[u] * inputs.loc[u, "nurse_per_bed"] * nurse_ratio_multiplier, f"Nurse_Ratio_{u}"
+        prob += doctors_var[u] >= beds_var[u] * inputs.loc[u, "doctor_per_bed"] * doctor_ratio_multiplier, f"Doctor_Ratio_{u}"
 
     prob += pulp.lpSum([
         beds_var[u] * inputs.loc[u, "avg_daily_bed_cost"] * 365
@@ -115,20 +119,40 @@ def _solve(inputs: pd.DataFrame, total_bed_stock: int, total_budget: float):
 
 
 @celery_app.task(name="model2.solve")
-def solve_model2() -> dict:
-    """The actual background job. Rebuilds inputs from the live
-    database, solves, and returns a full board-facing comparison --
-    recommended vs. current beds, staffing, and the cost delta.
-    """
+def solve_model2(
+    demand_buffer_pct: float = 0.0,
+    budget_multiplier: float = 1.0,
+    nurse_ratio_multiplier: float = 1.0,
+    doctor_ratio_multiplier: float = 1.0,
+) -> dict:
     inputs, total_bed_stock, total_budget, current_beds, latest_year = _load_inputs()
-    prob, beds_var, nurses_var, doctors_var = _solve(inputs, total_bed_stock, total_budget)
+    adjusted_budget = total_budget * budget_multiplier
+
+    prob, beds_var, nurses_var, doctors_var = _solve(
+        inputs, total_bed_stock, adjusted_budget,
+        demand_buffer_pct=demand_buffer_pct,
+        nurse_ratio_multiplier=nurse_ratio_multiplier,
+        doctor_ratio_multiplier=doctor_ratio_multiplier,
+    )
 
     status = pulp.LpStatus[prob.status]
+    assumptions = {
+        "demand_buffer_pct": demand_buffer_pct,
+        "budget_multiplier": budget_multiplier,
+        "nurse_ratio_multiplier": nurse_ratio_multiplier,
+        "doctor_ratio_multiplier": doctor_ratio_multiplier,
+        "is_baseline": (
+            demand_buffer_pct == 0.0 and budget_multiplier == 1.0
+            and nurse_ratio_multiplier == 1.0 and doctor_ratio_multiplier == 1.0
+        ),
+    }
+
     if status != "Optimal":
         return {
             "status": status,
-            "message": "No feasible configuration exists within the current "
-                       "budget and bed stock -- this is itself a real finding, "
+            "assumptions": assumptions,
+            "message": "No feasible configuration exists under these assumptions "
+                       "(budget/bed stock/ratios) -- this is itself a real finding, "
                        "not an error, and should be reported as such.",
         }
 
@@ -146,9 +170,10 @@ def solve_model2() -> dict:
 
     return {
         "status": status,
+        "assumptions": assumptions,
         "fiscal_year": latest_year,
         "total_bed_stock": total_bed_stock,
-        "total_budget_ngn": total_budget,
+        "total_budget_ngn": adjusted_budget,
         "optimal_annual_cost_ngn": round(optimal_cost, 0),
         "current_annual_cost_ngn": round(current_cost, 0),
         "annual_savings_ngn": round(current_cost - optimal_cost, 0),
